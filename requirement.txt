@@ -1,0 +1,7 @@
+accelerate==1.9.0
+datasets==4.0.0
+evaluate==0.4.5
+numpy==2.3.1
+packaging==25.0
+# torch==2.7.0+cu126
+transformers==4.49.0
