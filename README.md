@@ -1,4 +1,4 @@
-﻿# StarCLR Inference
+# StarCLR Inference
 
 This repository provides inference code for StarCLR, a Transformer-based contrastive pretraining framework for large-scale variable star light curves.
 
