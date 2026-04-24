@@ -23,6 +23,7 @@
 
 from typing import List, Optional, Tuple, Union
 
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -39,14 +40,15 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for
 
 logger = logging.get_logger(__name__)
 
-
-class BertEmbeddings(nn.Module):
+class BertPositionEmbedding(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
 
     def __init__(self, config):
         super().__init__()
-        self.toEmbedding = nn.Linear(2, config.hidden_size)
-        
+        self.toEmbedding = nn.Linear(1, config.hidden_size)
+
+        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
+        # any TensorFlow checkpoint file
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
@@ -54,6 +56,24 @@ class BertEmbeddings(nn.Module):
         self.register_buffer(
             "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
         )
+
+    def positional_encoding(self, embeds, time, base=10000):
+
+        B, L, H = embeds.size()
+        device = embeds.device
+
+        # j index: (1, 1, H)
+        j = torch.arange(H, dtype=torch.float32, device=device).view(1, 1, H)
+
+        # ω_j = 2pi / base^(j/H)
+        omega = 2 * math.pi / (base ** (j / H))
+
+        # pe shape = (B, L, H)
+        pe = torch.zeros(B, L, H, device=device)
+        pe[:, :, 0::2] = torch.sin(time * omega[:, :, 0::2])
+        pe[:, :, 1::2] = torch.cos(time * omega[:, :, 1::2])
+
+        return pe
 
     def forward(
         self,
@@ -64,13 +84,16 @@ class BertEmbeddings(nn.Module):
     ) -> torch.Tensor:
 
         if inputs_embeds is None:
-            inputs_embeds = self.toEmbedding(input_ids)  # (batch_size, seq_len, hidden_size)
+            flux_embeds = self.toEmbedding(input_ids[:, :, 1:2])                          # (batch_size, seq_len, hidden_size)
+            time_embeds = self.positional_encoding(flux_embeds, input_ids[:, :, 0:1])     # (batch_size, seq_len, hidden_size)
+            inputs_embeds =  flux_embeds + time_embeds
 
         inputs_embeds = self.LayerNorm(inputs_embeds)
         inputs_embeds = self.dropout(inputs_embeds)
         return inputs_embeds
 
-class BertModel(BertPreTrainedModel):
+
+class BertPositionEmbeddingModel(BertPreTrainedModel):
     """
 
     The model can behave as an encoder (with only self-attention) as well as a decoder, in which case a layer of
@@ -89,7 +112,7 @@ class BertModel(BertPreTrainedModel):
         super().__init__(config)
         self.config = config
 
-        self.embeddings = BertEmbeddings(config)
+        self.embeddings = BertPositionEmbedding(config)
         self.encoder = BertEncoder(config)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
@@ -248,13 +271,82 @@ class BertModel(BertPreTrainedModel):
             cross_attentions=encoder_outputs.cross_attentions,
         )
 
-class BertForSequenceClassificationTESS(BertPreTrainedModel):
+
+class BertForPositionEmbeddingHiddenStates(BertPreTrainedModel):
+    _tied_weights_keys = ["predictions.decoder.bias", "cls.predictions.decoder.weight"]
+
     def __init__(self, config):
         super().__init__(config)
-        self.config = config
-        self.num_labels = config.num_labels
 
-        self.bert = BertModel(config)
+        if config.is_decoder:
+            raise ValueError(f'is_decoder error')
+
+        self.bert = BertPositionEmbeddingModel(config, add_pooling_layer=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        feature: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], MaskedLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
+            config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked), the
+            loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`
+        """
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        # output_hidden_states = True
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs['last_hidden_state']
+
+        mask = attention_mask.unsqueeze(-1).expand_as(hidden_states).bool()
+
+        hidden_masked = hidden_states * mask.float()
+
+        valid_lengths = attention_mask.sum(dim=1).unsqueeze(-1)
+        pooled_logits = hidden_masked.sum(dim=1) / valid_lengths
+
+        loss = None
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=pooled_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class MLPModelTESS(nn.Module): 
+    def __init__(self, config, *args):
+        super().__init__()
+        self.num_labels = config.num_labels
+        self.config = config
+
         self.MLP1 = nn.Linear(config.hidden_size + 5, 2048)
         self.FineTuningLayerNorm1 = nn.LayerNorm(2048, eps=config.layer_norm_eps)
         self.MLP2 = nn.Linear(2048, 1024)
@@ -264,22 +356,11 @@ class BertForSequenceClassificationTESS(BertPreTrainedModel):
         self.score = nn.Linear(512, self.num_labels)
         self.act_fn = torch.nn.LeakyReLU(negative_slope=0.1)
 
-        # Initialize weights and apply final processing
-        self.post_init()
-
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
         feature: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -287,31 +368,8 @@ class BertForSequenceClassificationTESS(BertPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # output_hidden_states = True
 
-        outputs = self.bert(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = outputs['last_hidden_state']
-
-        mask = attention_mask.unsqueeze(-1).expand_as(hidden_states).bool()
-
-        hidden_masked = hidden_states * mask.float()
-
-        valid_lengths = attention_mask.sum(dim=1).unsqueeze(-1)  # [batch_size, 1]
-        pooled_logits = hidden_masked.sum(dim=1) / valid_lengths
-
-        pooled_logits = torch.cat((pooled_logits, feature), dim=1)
+        pooled_logits = torch.cat((hidden_states, feature), dim=1)
 
         pooled_logits = self.MLP1(pooled_logits)
         pooled_logits = self.FineTuningLayerNorm1(pooled_logits)
@@ -350,139 +408,20 @@ class BertForSequenceClassificationTESS(BertPreTrainedModel):
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
 
-        if not return_dict:
-            output = (pooled_logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
         return SequenceClassifierOutput(
             loss=loss,
             logits=pooled_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-class BertForSequenceClassificationZTF(BertPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.config = config
-        self.num_labels = config.num_labels
-
-        self.bert = BertModel(config)
-        self.MLP1 = nn.Linear(config.hidden_size + 6, 2048)
-        self.FineTuningLayerNorm1 = nn.LayerNorm(2048, eps=config.layer_norm_eps)
-        self.MLP2 = nn.Linear(2048, 1024)
-        self.FineTuningLayerNorm2 = nn.LayerNorm(1024, eps=config.layer_norm_eps)
-        self.MLP3 = nn.Linear(1024, 512)
-        self.FineTuningLayerNorm3 = nn.LayerNorm(512, eps=config.layer_norm_eps)
-        self.score = nn.Linear(512, self.num_labels)
-        # self.act_fn = ACT2FN[config.hidden_act]
-        self.act_fn = torch.nn.LeakyReLU(negative_slope=0.1)
-        
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        feature: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # output_hidden_states = True
-
-        outputs = self.bert(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = outputs['last_hidden_state']
-
-        mask = attention_mask.unsqueeze(-1).expand_as(hidden_states).bool()
-
-        hidden_masked = hidden_states * mask.float()
-
-        valid_lengths = attention_mask.sum(dim=1).unsqueeze(-1)  # [batch_size, 1]
-        pooled_logits = hidden_masked.sum(dim=1) / valid_lengths
-
-        pooled_logits = torch.cat((pooled_logits, feature), dim=1)
-
-        pooled_logits = self.MLP1(pooled_logits)
-        pooled_logits = self.FineTuningLayerNorm1(pooled_logits)
-        pooled_logits = self.act_fn(pooled_logits)
-
-        pooled_logits = self.MLP2(pooled_logits)
-        pooled_logits = self.FineTuningLayerNorm2(pooled_logits)
-        pooled_logits = self.act_fn(pooled_logits)
-
-        pooled_logits = self.MLP3(pooled_logits)
-        pooled_logits = self.FineTuningLayerNorm3(pooled_logits)
-        pooled_logits = self.act_fn(pooled_logits)
-        
-        pooled_logits = self.score(pooled_logits)
-
-        loss = None
-        if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
-
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(pooled_logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(pooled_logits, labels)
-
-        if not return_dict:
-            output = (pooled_logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=pooled_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            hidden_states=hidden_states,
+            attentions=None,
         )
     
-class BertForSequenceClassificationGaia(BertPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.config = config
-        self.num_labels = config.num_labels
 
-        self.bert = BertModel(config)
+class MLPModelZTF(nn.Module): 
+    def __init__(self, config, *args):
+        super().__init__()
+        self.num_labels = config.num_labels
+        self.config = config
+
         self.MLP1 = nn.Linear(config.hidden_size + 6, 2048)
         self.FineTuningLayerNorm1 = nn.LayerNorm(2048, eps=config.layer_norm_eps)
         self.MLP2 = nn.Linear(2048, 1024)
@@ -490,26 +429,13 @@ class BertForSequenceClassificationGaia(BertPreTrainedModel):
         self.MLP3 = nn.Linear(1024, 512)
         self.FineTuningLayerNorm3 = nn.LayerNorm(512, eps=config.layer_norm_eps)
         self.score = nn.Linear(512, self.num_labels)
-        # self.act_fn = ACT2FN[config.hidden_act]
         self.act_fn = torch.nn.LeakyReLU(negative_slope=0.1)
-        
-
-        # Initialize weights and apply final processing
-        self.post_init()
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
         feature: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -517,31 +443,8 @@ class BertForSequenceClassificationGaia(BertPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # output_hidden_states = True
 
-        outputs = self.bert(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = outputs['last_hidden_state']
-
-        mask = attention_mask.unsqueeze(-1).expand_as(hidden_states).bool()
-
-        hidden_masked = hidden_states * mask.float()
-
-        valid_lengths = attention_mask.sum(dim=1).unsqueeze(-1)  # [batch_size, 1]
-        pooled_logits = hidden_masked.sum(dim=1) / valid_lengths
-
-        pooled_logits = torch.cat((pooled_logits, feature), dim=1)
+        pooled_logits = torch.cat((hidden_states, feature), dim=1)
 
         pooled_logits = self.MLP1(pooled_logits)
         pooled_logits = self.FineTuningLayerNorm1(pooled_logits)
@@ -554,7 +457,7 @@ class BertForSequenceClassificationGaia(BertPreTrainedModel):
         pooled_logits = self.MLP3(pooled_logits)
         pooled_logits = self.FineTuningLayerNorm3(pooled_logits)
         pooled_logits = self.act_fn(pooled_logits)
-        
+
         pooled_logits = self.score(pooled_logits)
 
         loss = None
@@ -580,13 +483,84 @@ class BertForSequenceClassificationGaia(BertPreTrainedModel):
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
 
-        if not return_dict:
-            output = (pooled_logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=pooled_logits,
+            hidden_states=hidden_states,
+            attentions=None,
+        )
+
+
+class MLPModelGaia(nn.Module): 
+    def __init__(self, config, *args):
+        super().__init__()
+        self.num_labels = config.num_labels
+        self.config = config
+
+        self.MLP1 = nn.Linear(config.hidden_size + 6, 2048)
+        self.FineTuningLayerNorm1 = nn.LayerNorm(2048, eps=config.layer_norm_eps)
+        self.MLP2 = nn.Linear(2048, 1024)
+        self.FineTuningLayerNorm2 = nn.LayerNorm(1024, eps=config.layer_norm_eps)
+        self.MLP3 = nn.Linear(1024, 512)
+        self.FineTuningLayerNorm3 = nn.LayerNorm(512, eps=config.layer_norm_eps)
+        self.score = nn.Linear(512, self.num_labels)
+        self.act_fn = torch.nn.LeakyReLU(negative_slope=0.1)
+
+    def forward(
+        self,
+        hidden_states: Optional[torch.Tensor] = None,
+        feature: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+
+        pooled_logits = torch.cat((hidden_states, feature), dim=1)
+
+        pooled_logits = self.MLP1(pooled_logits)
+        pooled_logits = self.FineTuningLayerNorm1(pooled_logits)
+        pooled_logits = self.act_fn(pooled_logits)
+
+        pooled_logits = self.MLP2(pooled_logits)
+        pooled_logits = self.FineTuningLayerNorm2(pooled_logits)
+        pooled_logits = self.act_fn(pooled_logits)
+
+        pooled_logits = self.MLP3(pooled_logits)
+        pooled_logits = self.FineTuningLayerNorm3(pooled_logits)
+        pooled_logits = self.act_fn(pooled_logits)
+
+        pooled_logits = self.score(pooled_logits)
+
+        loss = None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(pooled_logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(pooled_logits, labels)
 
         return SequenceClassifierOutput(
             loss=loss,
             logits=pooled_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            hidden_states=hidden_states,
+            attentions=None,
         )

@@ -21,8 +21,7 @@ def preprocess_row_tess(row):
     filtered_sequence = (filtered_sequence - seq_min) / (seq_max - seq_min)
 
     times_min = np.min(filtered_times)
-    times_max = np.max(filtered_times)
-    filtered_times = (filtered_times - times_min) / (times_max - times_min)
+    filtered_times = filtered_times - times_min
 
     return {
         'input_ids': np.column_stack((filtered_times, filtered_sequence)).astype(np.float32),
@@ -59,8 +58,7 @@ def preprocess_row_ztf(row):
     filtered_sequence = (filtered_sequence - seq_min) / (seq_max - seq_min)
 
     times_min = np.min(filtered_times)
-    times_max = np.max(filtered_times)
-    filtered_times = (filtered_times - times_min) / (times_max - times_min)
+    filtered_times = filtered_times - times_min
 
     return {
         'input_ids': np.column_stack((filtered_times, filtered_sequence)).astype(np.float32),
@@ -93,8 +91,7 @@ def preprocess_row_gaia(row):
     filtered_sequence = (filtered_sequence - seq_min) / (seq_max - seq_min)
 
     times_min = np.min(filtered_times)
-    times_max = np.max(filtered_times)
-    filtered_times = (filtered_times - times_min) / (times_max - times_min)
+    filtered_times = filtered_times - times_min
 
     return {
         'input_ids': np.column_stack((filtered_times, filtered_sequence)).astype(np.float32),
@@ -103,4 +100,13 @@ def preprocess_row_gaia(row):
         'meta': {
             'Type': row['best_class_name'],
         }
+    }
+
+def preprocess_row_hidden_states(row):
+    hidden_states = np.asarray(row["hidden_states"], dtype=np.float32).copy()
+    feature = np.asarray(row["feature"], dtype=np.float32).copy()
+    return {
+        "hidden_states": hidden_states,
+        "feature": feature,
+        "meta": {"Type": row.get("Type", None)}
     }

@@ -2,7 +2,12 @@ import torch
 from torch.utils.data import Dataset
 
 
-class PreprocessedDataset(Dataset):
+class ModelInputDataset(Dataset):
+    """
+    Dataset providing raw model inputs:
+    light curves + attention mask + features.
+    Used for backbone forward inference.
+    """
     def __init__(self, data_list):
         self.data = data_list
 
@@ -19,7 +24,7 @@ class PreprocessedDataset(Dataset):
         }
 
 
-def collate_fn(batch):
+def collate_model_inputs(batch):
     max_len = max(item['input_ids'].shape[0] for item in batch)
     input_ids = []
     attention_masks = []
@@ -38,4 +43,30 @@ def collate_fn(batch):
         'attention_mask': torch.stack(attention_masks),
         'feature': torch.stack(features),
         'meta': metas
+    }
+
+class RepresentationDataset(Dataset):
+    """
+    Dataset providing fixed representations extracted from a pretrained backbone.
+    Used for downstream fine-tuning, probing, and visualization.
+    """
+    def __init__(self, data_list):
+        self.data = data_list
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        return {
+            "hidden_states": torch.from_numpy(item["hidden_states"]),
+            "feature": torch.from_numpy(item["feature"]),
+            "meta": item["meta"],
+        }
+
+def collate_representations(batch):
+    return {
+        "hidden_states": torch.stack([x["hidden_states"] for x in batch]),
+        "feature": torch.stack([x["feature"] for x in batch]),
+        "meta": [x["meta"] for x in batch],
     }

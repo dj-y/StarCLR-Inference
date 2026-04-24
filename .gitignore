@@ -6,3 +6,4 @@ example/*
 !example/.gitkeep
 __pycache__
 test.ipynb
+.vscode
