@@ -6,8 +6,8 @@ Note: this repo contains inference code only. Model weights and example data are
 
 ## Download Assets
 
-- Google Drive (weights + example data):
-  https://drive.google.com/drive/folders/1hNlb4Ulsd9nIfXJsLEAy6hem3XFv2i7V
+- Zenodo (weights + example data):
+  https://doi.org/10.5281/zenodo.19728042
 
 After downloading:
 
